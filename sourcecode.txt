@@ -1,0 +1,990 @@
+#include <iostream>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <windows.h>
+#include <Lmcons.h>
+#include <iomanip>
+#include <vector>
+#include <sstream>
+#include <thread>
+#include <iphlpapi.h>
+#include <shlobj.h>
+#include <cstdlib>
+#include <stdexcept>
+#include <direct.h> // for _access
+#include <io.h>     // for _access
+#include <guiddef.h>
+#include <combaseapi.h>
+#include "RandomId.h"
+#include <random>
+#include <algorithm>
+#include <locale>
+#include <codecvt>
+#include "utils.h"
+
+#pragma comment(lib, "iphlpapi.lib")
+
+std::string RandomId(int length) {
+    const char charset[] = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    std::default_random_engine rng(std::random_device{}());
+    std::uniform_int_distribution<> dist(0, sizeof(charset) - 2);
+    std::string result;
+    result.reserve(length);
+    for (int i = 0; i < length; ++i) {
+        result += charset[dist(rng)];
+    }
+    return result;
+}
+
+// Function to format a GUID with prefix
+std::wstring FormatGuid(const std::wstring& id1, const std::wstring& id2) {
+    return L"GS" + id1 + L"-" + id2 + L"-A";
+}
+
+std::wstring GenerateRandomId(size_t length) {
+    std::wstring characters = L"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    std::wstring result = L"GS";  // Prefix with 'GS'
+
+    for (size_t i = 0; i < length; ++i) {
+        result += characters[rand() % characters.size()];
+    }
+
+    return result;
+}
+
+// Function to set registry values
+void SetRegistryValue(HKEY hKey, const std::wstring& valueName, const std::wstring& value) {
+    RegSetValueExW(hKey, valueName.c_str(), 0, REG_SZ, (const BYTE*)value.c_str(), (value.size() + 1) * sizeof(wchar_t));
+}
+
+void GetRegistryValue(HKEY hKey, const std::wstring& valueName, std::wstring& value) {
+    DWORD type;
+    DWORD dataSize;
+    if (RegQueryValueExW(hKey, valueName.c_str(), nullptr, &type, nullptr, &dataSize) == ERROR_SUCCESS) {
+        std::vector<wchar_t> data(dataSize / sizeof(wchar_t));
+        if (RegQueryValueExW(hKey, valueName.c_str(), nullptr, &type, (LPBYTE)data.data(), &dataSize) == ERROR_SUCCESS) {
+            value.assign(data.begin(), data.end() - 1);  // Remove null terminator
+        }
+    }
+}
+
+std::wstring GetRegistryValue(HKEY hKey, const std::wstring& valueName) {
+    wchar_t value[256];
+    DWORD valueSize = sizeof(value);
+    DWORD type;
+
+    if (RegQueryValueExW(hKey, valueName.c_str(), nullptr, &type, (LPBYTE)value, &valueSize) == ERROR_SUCCESS) {
+        return std::wstring(value);
+    }
+    return L"";
+}
+
+// Function to set console text color
+void setColor(WORD color) {
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    SetConsoleTextAttribute(hConsole, color);
+}
+
+// Function to save old value to a file
+void saveOldValue(const std::string& filename, const std::string& value) {
+    std::ofstream file(filename);
+    if (file.is_open()) {
+        file << value;
+        file.close();
+    } else {
+        std::cerr << "Unable to open file for writing: " << filename << std::endl;
+    }
+}
+
+// Function to generate a new HWID
+std::string generateNewHWID() {
+    GUID guid;
+    CoCreateGuid(&guid);
+    char buffer[64] = { 0 };
+    snprintf(buffer, sizeof(buffer),
+             "GS-%08X-%04X-%04X-%04X-%012llX",
+             guid.Data1, guid.Data2, guid.Data3,
+             (guid.Data4[0] << 8) | guid.Data4[1],
+             *((uint64_t*)&guid.Data4[2]));
+    return std::string(buffer);
+}
+
+// Function to generate a new MAC address
+std::string generateNewMAC() {
+    GUID guid;
+    CoCreateGuid(&guid);
+    char buffer[18] = { 0 };
+    snprintf(buffer, sizeof(buffer),
+             "%02X:%02X:%02X:%02X:%02X:%02X",
+             guid.Data4[2], guid.Data4[3], guid.Data4[4],
+             guid.Data4[5], guid.Data4[6], guid.Data4[7]);
+    return std::string(buffer);
+}
+
+// Function to get current HWID from registry
+std::string getCurrentHWID() {
+    HKEY hKey;
+    char buffer[256];
+    DWORD bufferSize = sizeof(buffer);
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Cryptography", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+        RegQueryValueExA(hKey, "MachineGuid", NULL, NULL, (LPBYTE)buffer, &bufferSize);
+        RegCloseKey(hKey);
+        return std::string(buffer, buffer + bufferSize - 1);
+    }
+    return "";
+}
+
+// Function to get current MAC address using IP Helper API
+std::string getCurrentMAC() {
+    PIP_ADAPTER_INFO AdapterInfo;
+    DWORD dwBufLen = sizeof(AdapterInfo);
+    char *mac_addr = (char*)malloc(18);
+
+    AdapterInfo = (IP_ADAPTER_INFO *) malloc(sizeof(IP_ADAPTER_INFO));
+    if (AdapterInfo == NULL) {
+        std::cerr << "Error allocating memory" << std::endl;
+        exit(1);
+    }
+
+    if (GetAdaptersInfo(AdapterInfo, &dwBufLen) == ERROR_BUFFER_OVERFLOW) {
+        AdapterInfo = (IP_ADAPTER_INFO *) malloc(dwBufLen);
+        if (AdapterInfo == NULL) {
+            std::cerr << "Error allocating memory" << std::endl;
+            exit(1);
+        }
+    }
+
+    if (GetAdaptersInfo(AdapterInfo, &dwBufLen) == NO_ERROR) {
+        PIP_ADAPTER_INFO pAdapterInfo = AdapterInfo;
+        sprintf(mac_addr, "%02X:%02X:%02X:%02X:%02X:%02X",
+            pAdapterInfo->Address[0], pAdapterInfo->Address[1],
+            pAdapterInfo->Address[2], pAdapterInfo->Address[3],
+            pAdapterInfo->Address[4], pAdapterInfo->Address[5]);
+    }
+    free(AdapterInfo);
+    return std::string(mac_addr);
+}
+
+std::string wstring_to_string(const std::wstring& wstr) {
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(), NULL, 0, NULL, NULL);
+    std::string str(size_needed, 0);
+    WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int)wstr.size(), &str[0], size_needed, NULL, NULL);
+    return str;
+}
+
+// Function to get the current computer name
+std::string GetCurrentComputerName() {
+    DWORD size = MAX_COMPUTERNAME_LENGTH + 1;
+    std::vector<wchar_t> buffer(size);
+
+    if (GetComputerNameW(buffer.data(), &size)) {
+        std::wstring wideName(buffer.data());
+        return wstring_to_string(wideName);
+    } else {
+        return "Failed to get computer name. Error: " + std::to_string(GetLastError());
+    }
+}
+
+std::string ShowProductID() {
+    HKEY hKey;
+    const wchar_t* keyPath = L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
+    const wchar_t* valueName = L"ProductId";
+    std::wstring productID;
+
+    // Open the registry key using the wide character version of RegOpenKeyEx
+    LONG result = RegOpenKeyExW(HKEY_LOCAL_MACHINE, keyPath, 0, KEY_READ, &hKey);
+    if (result == ERROR_SUCCESS) {
+        DWORD dataSize = 0;
+        // Get the size of the value using the wide character version of RegQueryValueEx
+        result = RegQueryValueExW(hKey, valueName, nullptr, nullptr, nullptr, &dataSize);
+        if (result == ERROR_SUCCESS) {
+            productID.resize(dataSize / sizeof(wchar_t));
+            // Read the value using the wide character version of RegQueryValueEx
+            result = RegQueryValueExW(hKey, valueName, nullptr, nullptr, (LPBYTE)&productID[0], &dataSize);
+            if (result == ERROR_SUCCESS) {
+                // Remove the null terminator added by RegQueryValueEx
+                productID.resize(dataSize / sizeof(wchar_t) - 1);
+            } else {
+                std::cerr << "Failed to read the ProductId value." << std::endl;
+            }
+        } else {
+            std::cerr << "Failed to query the size of the ProductId value." << std::endl;
+        }
+        RegCloseKey(hKey);
+    } else {
+        std::cerr << "Failed to open registry key: " << keyPath << std::endl;
+    }
+
+    // Convert the wide string to a narrow string
+    int size_needed = WideCharToMultiByte(CP_UTF8, 0, &productID[0], (int)productID.size(), NULL, 0, NULL, NULL);
+    std::string productIDStr(size_needed, 0);
+    WideCharToMultiByte(CP_UTF8, 0, &productID[0], (int)productID.size(), &productIDStr[0], size_needed, NULL, NULL);
+
+    return productIDStr;
+}
+
+// Trim leading and trailing whitespace from a string
+std::string Trim(const std::string& str) {
+    auto start = str.find_first_not_of(" \t\n\r");
+    auto end = str.find_last_not_of(" \t\n\r");
+    return (start == std::string::npos || end == std::string::npos) ? "" : str.substr(start, end - start + 1);
+}
+
+std::string ShowCurrentDiskInfo() {
+    std::ostringstream output;
+    HKEY hScsiPorts;
+
+    // Open the Scsi key
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"HARDWARE\\DEVICEMAP\\Scsi", 0, KEY_READ, &hScsiPorts) == ERROR_SUCCESS) {
+        DWORD index = 0;
+        wchar_t portName[256];
+        DWORD portNameSize = sizeof(portName) / sizeof(portName[0]);
+
+        while (RegEnumKeyExW(hScsiPorts, index, portName, &portNameSize, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
+            std::wstring portPath = L"HARDWARE\\DEVICEMAP\\Scsi\\" + std::wstring(portName);
+            HKEY hScsiBuses;
+
+            // Open the ScsiBuses key
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, portPath.c_str(), 0, KEY_READ, &hScsiBuses) == ERROR_SUCCESS) {
+                DWORD busIndex = 0;
+                wchar_t busName[256];
+                DWORD busNameSize = sizeof(busName) / sizeof(busName[0]);
+
+                while (RegEnumKeyExW(hScsiBuses, busIndex, busName, &busNameSize, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
+                    std::wstring busPath = portPath + L"\\" + std::wstring(busName) + L"\\Target Id 0\\Logical Unit Id 0";
+                    HKEY hScsiBus;
+
+                    // Open the ScsiBus key
+                    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, busPath.c_str(), 0, KEY_READ, &hScsiBus) == ERROR_SUCCESS) {
+                        std::wstring identifier, serialNumber, inquiryData, deviceIdentifierPage;
+
+                        // Retrieve values
+                        GetRegistryValue(hScsiBus, L"Identifier", identifier);
+                        GetRegistryValue(hScsiBus, L"SerialNumber", serialNumber);
+
+                        // Append details to the output with proper formatting
+                        output << "Identifier:\n" << Trim(WStringToString(identifier)) << std::endl;
+                        output << "SerialNumber:\n" << Trim(WStringToString(serialNumber)) << std::endl;
+                        output << std::endl; // Add a blank line for separation between entries
+
+                        RegCloseKey(hScsiBus);
+                    }
+                    busIndex++;
+                    busNameSize = sizeof(busName) / sizeof(busName[0]);
+                }
+                RegCloseKey(hScsiBuses);
+            }
+            index++;
+            portNameSize = sizeof(portName) / sizeof(portName[0]);
+        }
+        RegCloseKey(hScsiPorts);
+    }
+    return output.str();
+}
+
+// Function to change HWID
+void changeHWID() {
+    std::string oldHWID = getCurrentHWID();
+    saveOldValue("old_hwid.txt", oldHWID);
+
+    std::string newHWID = generateNewHWID();
+    HKEY hKey;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Cryptography", 0, KEY_WRITE, &hKey) == ERROR_SUCCESS) {
+        RegSetValueExA(hKey, "MachineGuid", 0, REG_SZ, (const BYTE*)newHWID.c_str(), newHWID.size() + 1);
+        RegCloseKey(hKey);
+    }
+}
+
+// Function to change MAC address using PowerShell
+void changeMAC() {
+    std::string oldMAC = getCurrentMAC();
+    saveOldValue("old_mac.txt", oldMAC);
+
+    std::string newMAC = generateNewMAC();
+
+    // Command to change the MAC address and suppress confirmation prompts
+    std::ostringstream cmd;
+    cmd << "powershell -ExecutionPolicy Bypass -Command \""
+        << "$adapter = Get-NetAdapter | Where-Object {$_.Status -eq 'Up'}; "
+        << "if ($adapter) { "
+        << "$adapter | Set-NetAdapter -MacAddress '" << newMAC << "' -Confirm:$false; "
+        << "Restart-NetAdapter -Name $adapter.Name -Confirm:$false; }\"";
+
+    auto runCommand = [&cmd]() {
+        STARTUPINFO si = { sizeof(si) };
+        PROCESS_INFORMATION pi;
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE; // Hide the window
+
+        if (CreateProcess(NULL, const_cast<LPSTR>(cmd.str().c_str()), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        }
+    };
+
+    const int maxRetries = 3;
+    bool success = false;
+
+    for (int attempt = 0; attempt < maxRetries; ++attempt) {
+        // Start the command in a separate thread
+        std::thread commandThread(runCommand);
+        Sleep(5000); // Simulating progress
+
+        // Wait for the command thread to finish
+        commandThread.join();
+
+        // Check if MAC address has been successfully changed
+        if (getCurrentMAC() == newMAC) {
+            success = true;
+            break;
+        }
+    }
+}
+
+// Function to generate a new computer name and set it
+void GenerateAndSetComputerName() {
+    // Generate a new computer name
+    std::wstring prefix = L"GS";
+    std::wstring newName = prefix;
+
+    // Seed the random number generator and generate a random 4-digit number
+    std::srand(static_cast<unsigned>(std::time(nullptr)));
+    int randomNumber = std::rand() % 10000; // Random number between 0 and 9999
+    newName += std::to_wstring(randomNumber);
+
+    // Ensure the name is within the allowed length (15 characters max for computer names)
+    if (newName.length() > 15) {
+        newName = newName.substr(0, 15);
+    }
+}
+
+void SpoofInstallationID() {
+    HKEY hKey;
+    const wchar_t* keyPath = L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
+    const wchar_t* valueName = L"InstallationID";
+
+    // Open the registry key using the wide character version of RegOpenKeyEx
+    LONG result = RegOpenKeyExW(HKEY_LOCAL_MACHINE, keyPath, 0, KEY_WRITE, &hKey);
+    if (result == ERROR_SUCCESS) {
+        GUID guid;
+        CoCreateGuid(&guid);
+        wchar_t guidString[40] = { 0 };
+        StringFromGUID2(guid, guidString, 40);
+
+        std::wstring newInstallationID = guidString;
+        // Set the new InstallationID using the wide character version of RegSetValueEx
+        result = RegSetValueExW(hKey, valueName, 0, REG_SZ, (const BYTE*)newInstallationID.c_str(), (newInstallationID.size() + 1) * sizeof(wchar_t));
+
+        if (result == ERROR_SUCCESS) {
+            std::wcout << L"InstallationID spoofed to: " << newInstallationID << std::endl;
+        } else {
+            std::wcout << L"Failed to set InstallationID." << std::endl;
+        }
+
+        RegCloseKey(hKey);
+    } else {
+        std::wcout << L"Failed to open registry key for writing." << std::endl;
+    }
+}
+
+void SpoofDisks() {
+    // Open the Scsi key
+    HKEY hScsiPorts;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"HARDWARE\\DEVICEMAP\\Scsi", 0, KEY_READ, &hScsiPorts) == ERROR_SUCCESS) {
+        DWORD index = 0;
+        wchar_t portName[256];
+        DWORD portNameSize = sizeof(portName) / sizeof(portName[0]);
+
+        while (RegEnumKeyExW(hScsiPorts, index, portName, &portNameSize, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
+            std::wstring portPath = L"HARDWARE\\DEVICEMAP\\Scsi\\" + std::wstring(portName);
+            HKEY hScsiBuses;
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, portPath.c_str(), 0, KEY_READ, &hScsiBuses) == ERROR_SUCCESS) {
+                DWORD busIndex = 0;
+                wchar_t busName[256];
+                DWORD busNameSize = sizeof(busName) / sizeof(busName[0]);
+
+                while (RegEnumKeyExW(hScsiBuses, busIndex, busName, &busNameSize, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
+                    std::wstring busPath = portPath + L"\\" + std::wstring(busName) + L"\\Target Id 0\\Logical Unit Id 0";
+                    HKEY hScsiBus;
+                    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, busPath.c_str(), 0, KEY_WRITE | KEY_READ, &hScsiBus) == ERROR_SUCCESS) {
+                        DWORD type;
+                        wchar_t deviceType[256];
+                        DWORD deviceTypeSize = sizeof(deviceType);
+
+                        if (RegQueryValueExW(hScsiBus, L"DeviceType", nullptr, &type, (LPBYTE)deviceType, &deviceTypeSize) == ERROR_SUCCESS && std::wstring(deviceType) == L"DiskPeripheral") {
+                            // Generate and format new IDs with prefix
+                            std::wstring identifier1 = GenerateRandomId(8);
+                            std::wstring identifier2 = GenerateRandomId(8);
+                            std::wstring serialNumber = GenerateRandomId(14);
+
+                            std::wstring identifier = FormatGuid(identifier1, identifier2);
+
+                            // Set new values
+                            SetRegistryValue(hScsiBus, L"DeviceIdentifierPage", serialNumber);
+                            SetRegistryValue(hScsiBus, L"Identifier", identifier);
+                            SetRegistryValue(hScsiBus, L"InquiryData", identifier);
+                            SetRegistryValue(hScsiBus, L"SerialNumber", serialNumber);
+                        }
+                        RegCloseKey(hScsiBus);
+                    }
+                    busIndex++;
+                    busNameSize = sizeof(busName) / sizeof(busName[0]);
+                }
+                RegCloseKey(hScsiBuses);
+            }
+            index++;
+            portNameSize = sizeof(portName) / sizeof(portName[0]);
+        }
+        RegCloseKey(hScsiPorts);
+    }
+
+    // Open the DiskPeripheral key
+    HKEY hDiskPeripherals;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\MultifunctionAdapter\\0\\DiskController\\0\\DiskPeripheral", 0, KEY_READ, &hDiskPeripherals) == ERROR_SUCCESS) {
+        DWORD index = 0;
+        wchar_t diskName[256];
+        DWORD diskNameSize = sizeof(diskName) / sizeof(diskName[0]);
+
+        while (RegEnumKeyExW(hDiskPeripherals, index, diskName, &diskNameSize, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
+            std::wstring diskPath = L"HARDWARE\\DESCRIPTION\\System\\MultifunctionAdapter\\0\\DiskController\\0\\DiskPeripheral\\" + std::wstring(diskName);
+            HKEY hDiskPeripheral;
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, diskPath.c_str(), 0, KEY_WRITE, &hDiskPeripheral) == ERROR_SUCCESS) {
+                // Generate and format new identifier with prefix
+                std::wstring identifier1 = GenerateRandomId(8);
+                std::wstring identifier2 = GenerateRandomId(8);
+                std::wstring identifier = FormatGuid(identifier1, identifier2);
+
+                // Set new value
+                SetRegistryValue(hDiskPeripheral, L"Identifier", identifier);
+
+                RegCloseKey(hDiskPeripheral);
+            }
+            index++;
+            diskNameSize = sizeof(diskName) / sizeof(diskName[0]);
+        }
+        RegCloseKey(hDiskPeripherals);
+    }
+}
+
+// Helper function to convert a wide string to a string
+std::string WideStringToString(const std::wstring& wideString) {
+    std::string str(wideString.begin(), wideString.end());
+    return str;
+}
+
+// Function to generate a unique hardware ID
+std::wstring GenerateUniqueHardwareID() {
+    std::wstringstream idStream;
+    idStream << L"PCI\\VEN_8086&DEV_1234&SUBSYS_5678ABCD&REV_";
+
+    // Generate a unique part of the ID using a timestamp
+    std::time_t now = std::time(nullptr);
+    idStream << std::hex << std::uppercase << (now % 0xFFFF);
+
+    return idStream.str();
+}
+
+void SpoofGPU() {
+    HKEY hKey;
+    LPCWSTR keyName = L"SYSTEM\\CurrentControlSet\\Enum\\PCI\\VEN_10DE&DEV_0DE1&SUBSYS_37621462&REV_A1";
+
+    // Generate a new unique hardware ID
+    std::wstring newHardwareID = GenerateUniqueHardwareID();
+    LPCWSTR newHardwareIDStr = newHardwareID.c_str();
+
+    // Open the registry key with write access
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, keyName, 0, KEY_WRITE, &hKey) == ERROR_SUCCESS) {
+        // Prepare new values
+        LPCWSTR compatibleIDs[] = { newHardwareIDStr, L"" }; // Double null-terminated for REG_MULTI_SZ
+        LPCWSTR driver = L"pci.sys";
+        LPCWSTR classGUID = L"{4d36e968-e325-11ce-bfc1-08002be10318}";
+        LPCWSTR classValue = L"Display";
+
+        // Set the new values in the registry
+        // HardwareID
+        DWORD hardwareIDSize = (DWORD)((newHardwareID.length() + 1) * sizeof(wchar_t) * 2); // +1 for null terminator
+        RegSetValueExW(hKey, L"HardwareID", 0, REG_MULTI_SZ,
+                       (const BYTE*)compatibleIDs,
+                       hardwareIDSize);
+
+        // Driver
+        RegSetValueExW(hKey, L"Driver", 0, REG_SZ,
+                       (const BYTE*)driver,
+                       (DWORD)((wcslen(driver) + 1) * sizeof(wchar_t)));
+
+        // ConfigFlags
+        DWORD configFlags = 0x00000000;
+        RegSetValueExW(hKey, L"ConfigFlags", 0, REG_DWORD,
+                       (const BYTE*)&configFlags,
+                       sizeof(DWORD));
+
+        // ClassGUID
+        RegSetValueExW(hKey, L"ClassGUID", 0, REG_SZ,
+                       (const BYTE*)classGUID,
+                       (DWORD)((wcslen(classGUID) + 1) * sizeof(wchar_t)));
+
+        // Class
+        RegSetValueExW(hKey, L"Class", 0, REG_SZ,
+                       (const BYTE*)classValue,
+                       (DWORD)((wcslen(classValue) + 1) * sizeof(wchar_t)));
+
+        // Close the registry key
+        RegCloseKey(hKey);
+    } else {
+        std::wcerr << L"Failed to open the registry key." << std::endl;
+    }
+}
+
+// Function to generate a random alphanumeric string with the given length
+std::string GenerateRandomSerial(int length) {
+    const std::string chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    std::random_device rd;
+    std::mt19937 generator(rd());
+    std::uniform_int_distribution<> distribution(0, chars.size() - 1);
+
+    std::string randomString;
+    for (int i = 0; i < length; ++i) {
+        randomString += chars[distribution(generator)];
+    }
+
+    return randomString;
+}
+
+void SpoofSMBIOSSerialNumber() {
+    HKEY hKey;
+    LONG result = RegOpenKeyEx(HKEY_LOCAL_MACHINE, "HARDWARE\\DESCRIPTION\\System\\BIOS", 0, KEY_SET_VALUE, &hKey);
+
+    if (result == ERROR_SUCCESS) {
+        std::string serialNumber = GenerateRandomSerial(10); // Adjust length as needed
+        result = RegSetValueEx(hKey, "SystemSerialNumber", 0, REG_SZ, reinterpret_cast<const BYTE*>(serialNumber.c_str()), serialNumber.size() + 1);
+
+        if (result == ERROR_SUCCESS) {
+            std::cout << "\n[+] Serial number spoofed successfully! New Serial Number: " << serialNumber << "\n";
+        } else {
+            std::cout << "\n[X] Failed to set the serial number.\n";
+        }
+
+        RegCloseKey(hKey);
+    } else {
+        std::cout << "\n[X] Can't find the SMBIOS.\n";
+    }
+}
+
+void SpoofEFIVariableId() {
+    HKEY hKey;
+    LPCWSTR subKey = L"SYSTEM\\CurrentControlSet\\Control\\Nsi\\{eb004a03-9b1a-11d4-9123-0050047759bc}\\26";
+    LONG result;
+
+    // Open the registry key
+    result = RegOpenKeyExW(HKEY_LOCAL_MACHINE, subKey, 0, KEY_SET_VALUE | KEY_QUERY_VALUE, &hKey);
+    if (result == ERROR_SUCCESS) {
+        // Retrieve the current value of "VariableId"
+        wchar_t existingGuidString[40];
+        DWORD bufferSize = sizeof(existingGuidString);
+        result = RegQueryValueExW(hKey, L"VariableId", NULL, NULL, (BYTE*)existingGuidString, &bufferSize);
+
+        // Display the current value if it exists
+        if (result == ERROR_SUCCESS) {
+            std::wcout << L"[*] Current VariableId: " << existingGuidString << std::endl;
+        } else {
+            std::wcout << L"[*] Current VariableId not found or cannot be read." << std::endl;
+        }
+
+        // Generate a new GUID
+        GUID newGuid;
+        CoCreateGuid(&newGuid);
+        wchar_t newGuidString[40];
+        StringFromGUID2(newGuid, newGuidString, 40);
+
+        // Set the new GUID as the value of "VariableId"
+        result = RegSetValueExW(hKey, L"VariableId", 0, REG_SZ, (const BYTE*)newGuidString, (DWORD)(wcslen(newGuidString) + 1) * sizeof(wchar_t));
+        if (result == ERROR_SUCCESS) {
+            std::wcout << L"[*] New VariableId set to: " << newGuidString << std::endl;
+        } else {
+            std::wcerr << L"[X] Failed to set registry value!" << std::endl;
+        }
+
+        // Close the registry key
+        RegCloseKey(hKey);
+    } else {
+        std::wcerr << L"[X] Failed to open registry key. Ensure you have administrative privileges." << std::endl;
+    }
+}
+
+void spoofAll() {
+    setColor(10); // Green color
+    std::cout << "Spoofing... " << std::endl;
+
+    // Start both spoofing processes in separate threads
+    std::thread hwidThread(changeHWID);
+    std::thread macThread(changeMAC);
+    std::thread cnThread(GenerateAndSetComputerName);
+    std::thread IIDThread(SpoofInstallationID);
+    std::thread diskThread(SpoofDisks);
+    std::thread EVIThread(SpoofEFIVariableId);
+    std::thread GPUThread(SpoofGPU);
+
+    // Wait for both threads to complete
+    hwidThread.join();
+    macThread.join();
+    cnThread.join();
+    IIDThread.join();
+    diskThread.join();
+    EVIThread.join();
+    GPUThread.join();
+
+    setColor(10); // Green color
+    std::cout << "Done!" << std::endl;
+    std::cout << "Restart computer!" << std::endl;
+    setColor(7); // Default color
+}
+
+void FivemSpoof() {
+    setColor(10); // Green color
+    std::cout << "Spoofing... " << std::endl;
+
+    // Start both spoofing processes in separate threads
+    std::thread hwidThread(changeHWID);
+    std::thread macThread(changeMAC);
+    // Wait for both threads to complete
+    hwidThread.join();
+    macThread.join();
+
+    setColor(10); // Green color
+    std::cout << "Done!" << std::endl;
+    setColor(7); // Default color
+}
+
+// Function to display current HWID and MAC
+void checkCurrentHWIDandMAC() {
+    std::string currentHWID = getCurrentHWID();
+    std::string currentMAC = getCurrentMAC();
+    std::string currentCN = GetCurrentComputerName();
+    std::string currentPID = ShowProductID();
+    std::string currentDISK = ShowCurrentDiskInfo();
+    setColor(15); // Violet color
+    std::cout << "Current HWID: " << currentHWID << std::endl;
+    std::cout << "Current MAC: " << currentMAC << std::endl;
+    std::cout << "Current Computer Name: " << currentCN << std::endl;
+    std::cout << "Current Product ID: " << currentPID << std::endl;
+    std::cout << "Current DISK IDS: " << std::endl;
+    std::cout << currentDISK << std::endl;
+    setColor(7); // Default color
+}
+
+// Function to open file dialog and get folder path
+std::string openFileDialog() {
+    BROWSEINFO bi = { 0 };
+    bi.lpszTitle = "Select Folder";
+    LPITEMIDLIST pidl = SHBrowseForFolder(&bi);
+    if (pidl != 0) {
+        char path[MAX_PATH];
+        SHGetPathFromIDList(pidl, path);
+        IMalloc* imalloc = 0;
+        if (SUCCEEDED(SHGetMalloc(&imalloc))) {
+            imalloc->Free(pidl);
+            imalloc->Release();
+        }
+        return std::string(path);
+    }
+    return "";
+}
+
+// Function to delete a folder and its contents
+void deleteFolder(const std::string& folderPath) {
+    std::string command = "rmdir /s /q \"" + folderPath + "\"";
+    system(command.c_str());
+}
+
+// Function to check if a folder exists
+bool folderExists(const std::string& folderPath) {
+    return _access(folderPath.c_str(), 0) == 0;
+}
+
+// Function to update folder paths in the config file
+void updateConfig(const std::string& dataFolderPath, const std::string& citizenFXFolderPath, const std::string& digitalEntitlementsFolderPath) {
+    std::ofstream config("fivem_config.txt");
+    if (config.is_open()) {
+        config << dataFolderPath << std::endl;
+        config << citizenFXFolderPath << std::endl;
+        config << digitalEntitlementsFolderPath << std::endl;
+        config.close();
+    } else {
+        std::cerr << "Unable to open config file for writing." << std::endl;
+    }
+}
+
+// Function to handle FiveM folder options
+void manageFiveMFolders() {
+    std::string dataFolderPath = "no path";
+    std::string citizenFXFolderPath = "no path";
+    std::string digitalEntitlementsFolderPath = "no path";
+
+    // Load paths from config if they exist
+    std::ifstream config("fivem_config.txt");
+    if (config.is_open()) {
+        std::getline(config, dataFolderPath);
+        std::getline(config, citizenFXFolderPath);
+        std::getline(config, digitalEntitlementsFolderPath);
+        config.close();
+    }
+
+    while (true) {
+        system("cls");
+
+        setColor(9); // Violet color
+        std::cout << "***************************************" << std::endl;
+        std::cout << "        FIVEM FOLDER MANAGEMENT" << std::endl;
+        std::cout << "***************************************" << std::endl;
+        setColor(7); // Default color
+        setColor(15); // Cyan color
+        std::cout << "1. FiveM data folder // path status: ";
+        setColor(7); // Default color
+        setColor(dataFolderPath == "no path" ? 8 : 10); // Grey or Green
+        std::cout << (dataFolderPath == "no path" ? "NOT SELECTED" : "SELECTED");
+        setColor(7); // Default color
+        setColor(15); // Cyan color
+        std::cout << " // folder status: ";
+        setColor(7); // Default color
+        setColor(folderExists(dataFolderPath) ? 10 : 12); // Green or Red
+        std::cout << (folderExists(dataFolderPath) ? "EXIST" : "DELETED") << std::endl;
+        setColor(7); // Default color
+        setColor(15); // Cyan color
+        std::cout << "2. FiveM CitizenFX folder // path status: ";
+        setColor(7); // Default color
+        setColor(citizenFXFolderPath == "no path" ? 8 : 10); // Grey or Green
+        std::cout << (citizenFXFolderPath == "no path" ? "NOT SELECTED" : "SELECTED");
+        setColor(7); // Default color
+        setColor(15); // Cyan color
+        std::cout << " // folder status: ";
+        setColor(7); // Default color
+        setColor(folderExists(citizenFXFolderPath) ? 10 : 12); // Green or Red
+        std::cout << (folderExists(citizenFXFolderPath) ? "EXIST" : "DELETED") << std::endl;
+        setColor(7); // Default color
+        setColor(15); // Cyan color
+        std::cout << "3. DigitalEntitlements folder // path status: ";
+        setColor(7); // Default color
+        setColor(digitalEntitlementsFolderPath == "no path" ? 8 : 10); // Grey or Green
+        std::cout << (digitalEntitlementsFolderPath == "no path" ? "NOT SELECTED" : "SELECTED");
+        setColor(7); // Default color
+        setColor(15); // Cyan color
+        std::cout << " // folder status: ";
+        setColor(7); // Default color
+        setColor(folderExists(digitalEntitlementsFolderPath) ? 10 : 12); // Green or Red
+        std::cout << (folderExists(digitalEntitlementsFolderPath) ? "EXIST" : "DELETED") << std::endl;
+        setColor(7); // Default color
+        setColor(12); // Red color
+        std::cout << "4. Delete folder" << std::endl;
+        setColor(7); // Default color
+        setColor(10); // Green color
+        std::cout << "5. Refresh folder statuses" << std::endl;
+        setColor(7); // Default color
+        setColor(12); // Red color
+        std::cout << "0. Back to main menu" << std::endl;
+        setColor(9); // Red color
+        std::cout << "***************************************" << std::endl;
+        setColor(7); // Default color
+
+        int choice;
+        std::cin >> choice;
+
+        switch (choice) {
+            case 1:
+                {
+                    dataFolderPath = openFileDialog();
+                    updateConfig(dataFolderPath, citizenFXFolderPath, digitalEntitlementsFolderPath);
+                    break;
+                }
+            case 2:
+                {
+                    citizenFXFolderPath = openFileDialog();
+                    updateConfig(dataFolderPath, citizenFXFolderPath, digitalEntitlementsFolderPath);
+                    break;
+                }
+            case 3:
+                {
+                    digitalEntitlementsFolderPath = openFileDialog();
+                    updateConfig(dataFolderPath, citizenFXFolderPath, digitalEntitlementsFolderPath);
+                    break;
+                }
+            case 4: {
+                std::string folderToDelete;
+                std::cout << "Enter folder to delete (data, CitizenFX, DigitalEntitlements, or all): ";
+                std::cin >> folderToDelete;
+                if (folderToDelete == "data" && dataFolderPath != "no path") {
+                    deleteFolder(dataFolderPath);
+                } else if (folderToDelete == "CitizenFX" && citizenFXFolderPath != "no path") {
+                    deleteFolder(citizenFXFolderPath);
+                } else if (folderToDelete == "DigitalEntitlements" && digitalEntitlementsFolderPath != "no path") {
+                    deleteFolder(digitalEntitlementsFolderPath);
+                } else if (folderToDelete == "all") {
+                    if (dataFolderPath != "no path") {
+                        deleteFolder(dataFolderPath);
+                    }
+                    if (citizenFXFolderPath != "no path") {
+                        deleteFolder(citizenFXFolderPath);
+                    }
+                    if (digitalEntitlementsFolderPath != "no path") {
+                        deleteFolder(digitalEntitlementsFolderPath);
+                    }
+                }
+                updateConfig(dataFolderPath, citizenFXFolderPath, digitalEntitlementsFolderPath);
+                break;
+            }
+            case 5:
+                // Refresh folder statuses
+                updateConfig(dataFolderPath, citizenFXFolderPath, digitalEntitlementsFolderPath);
+                break;
+            case 0:
+                return;
+            default:
+                std::cerr << "Invalid choice!" << std::endl;
+                break;
+        }
+        setColor(9); // Violet color
+        std::cout << "Press Enter to continue..." << std::endl;
+        setColor(7); // Default color
+        std::cin.ignore();
+        std::cin.get();
+    }
+}
+
+// Function PRINT UNBAN METHOD
+void createMethodFile() {
+    // Define the content to be written to the file
+    const char* content =
+        "Unban Method\n\n"
+        "1. Uninstall FiveM using Revo Uninstaller. link - https://www.revouninstaller.com/start-freeware-download/\n"
+        "2. Unlink microsoft user from local pc.\n"
+        "3. Delete windows apps by XBOX using revo unistaller\n"
+        "4. Delete DigitalEntitlements, CitizenFX, and the entire FiveM data folder.\n"
+        "5. Delete HKEY_CURRENT_USER\\SOFTWARE\\Microsoft\\Internet Explorer\\LowRegistry\\Audio\\PolicyConfig\\PropertyStore.\n"
+        "6. Use a spoofer. (OR HWID TOOL PROVIDED IN .RAR)\n"
+        "7. Reinstall FiveM but don't log in.\n"
+        "8. Delete HKEY_CURRENT_USER\\SOFTWARE\\Microsoft\\Internet Explorer\\LowRegistry\\Audio\\PolicyConfig\\PropertyStore.\n"
+        "9. Log into a new Discord, Steam, and Rockstar account (close FiveM using Task Manager when loading into FiveM).\n"
+        "10. Turn on a VPN (NordVPN recommended).\n"
+        "11. Delete HKEY_CURRENT_USER\\SOFTWARE\\Microsoft\\Internet Explorer\\LowRegistry\\Audio\\PolicyConfig\\PropertyStore.\n"
+        "12. Open FiveM.\n"
+        "13. Delete HKEY_CURRENT_USER\\SOFTWARE\\Microsoft\\Internet Explorer\\LowRegistry\\Audio\\PolicyConfig\\PropertyStore.\n"
+        "14. Join a server you like.\n\n"
+        "IMPORTANT:\n\n"
+        "Delete PropertyStore every time after restarting your PC before turning on FiveM.\n\n"
+        "It is recommended to delete PropertyStore every time as provided in the method.\n\n"
+        "Logically, it would be enough to delete it only once after turning on the VPN, but\n"
+        "FiveGuard uses exploits in FiveM to detect the moment you enter the server. This is\n"
+        "why it is necessary to delete it multiple times (for safety reasons).\n";
+
+    // Open a file in write mode
+    std::ofstream file("method.txt");
+
+    // Check if the file is open
+    if (file.is_open()) {
+        // Write the content to the file
+        file << content;
+
+        // Close the file
+        file.close();
+        setColor(10); // Green color
+        std::cout << "Generating unban method ... " << std::endl;
+        Sleep(4000); // Simulating progress
+        setColor(10); // Default color
+        std::cout << "method.txt has been created successfully.\n" << std::endl;
+    } else {
+        setColor(12); // Default color
+        std::cerr << "Unable to open file.\n" << std::endl;
+        setColor(7); // Default color
+    }
+}
+
+int main() {
+    // Check if program is running as administrator
+    BOOL isAdmin = FALSE;
+    PSID administratorsGroup = NULL;
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+    if (AllocateAndInitializeSid(&ntAuthority, 2,
+        SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
+        0, 0, 0, 0, 0, 0, &administratorsGroup)) {
+        CheckTokenMembership(NULL, administratorsGroup, &isAdmin);
+        FreeSid(administratorsGroup);
+    }
+
+    if (!isAdmin) {
+        std::cerr << "This program must be run as an administrator." << std::endl;
+        return 1;
+    }
+
+    while (true) {
+        // Clear screen or print enough blank lines
+        system("cls"); // This clears the console screen on Windows
+
+        // Print the decorative text in blue
+        setColor(9); // Blue color
+        std::cout << "  ______    ______         __    __  __       __  ______  _______  " << std::endl;
+        std::cout << " /      \\  /      \\       |  \\  |  \\|  \\  _  |  \\|      \\|       \\ " << std::endl;
+        std::cout << "|  $$$$$$\\|  $$$$$$\\      | $$  | $$| $$ / \\ | $$ \\$$$$$$| $$$$$$$\\ " << std::endl;
+        std::cout << "| $$ __\\$$| $$___\\$$      | $$__| $$| $$/  \\ | $$  | $$  | $$  | $$" << std::endl;
+        std::cout << "| $$|    \\ \\$$    \\       | $$    $$| $$  $$$\\ $$  | $$  | $$  | $$" << std::endl;
+        std::cout << "| $$ \\$$$$ _\\$$$$$$\\      | $$$$$$$$| $$ $$\\$$\\$$  | $$  | $$  | $$" << std::endl;
+        std::cout << "| $$__| $$|  \\__| $$      | $$  | $$| $$$$  \\$$$$ _| $$_ | $$__/ $$" << std::endl;
+        std::cout << " \\$$    $$ \\$$    $$      | $$  | $$| $$$    \\$$$|   $$ \\| $$    $$" << std::endl;
+        std::cout << "  \\$$$$$$   \\$$$$$$        \\$$   \\$$ \\$$      \\$$ \\$$$$$$ \\$$$$$$$ " << std::endl;
+        std::cout << "                                                                   " << std::endl;
+        setColor(7); // Default color
+
+        int choice;
+        setColor(9); // Violet color for options
+        std::cout << "****************************************" << std::endl;
+        setColor(9); // Violet color for options
+        std::cout << "            CHOOSE AN OPTION:           " << std::endl;
+        std::cout << "****************************************" << std::endl;
+        setColor(15); // Red color for options
+        std::cout << "1. Spoof (FIVEM ONLY)" << std::endl;
+        std::cout << "2. Spoof (ALL,WORKS FOR MOST GAMES)" << std::endl;
+        std::cout << "3. Check my DEFAULT/CHANGED Serials" << std::endl;
+        std::cout << "4. Manage folders (BETA)" << std::endl;
+        std::cout << "5. Unban METHOD" << std::endl;
+        setColor(12); // Default color
+        std::cout << "0. Exit" << std::endl;
+        setColor(9); // Violet color for options
+        std::cout << "****************************************" << std::endl;
+        std::cout << "             MADE BY GRIZZLY             " << std::endl;
+        std::cout << "****************************************" << std::endl;
+        setColor(7); // Default color
+        std::cin >> choice;
+
+        switch (choice) {
+            case 1:
+                FivemSpoof();
+                break;
+            case 2:
+                spoofAll();
+                break;
+            case 3:
+                checkCurrentHWIDandMAC();
+                break;
+            case 4:
+                manageFiveMFolders();
+                break;
+            case 5:
+                createMethodFile();
+                break;
+            case 0:
+                return 0;
+            default:
+                std::cerr << "Invalid choice!" << std::endl;
+                break;
+        }
+
+        // Return to the main menu
+        setColor(9); // Violet color
+        std::cout << std::endl << "Press Enter to return to the main menu..." << std::endl;
+        setColor(12); // Default color
+        std::cin.ignore();
+        std::cin.get();
+    }
+
+    return 0;
+}
